@@ -617,20 +617,84 @@ export default function App() {
           )}
         </main>
 
-        <MobileBottomNav activeTab={activeTab} onSelectTab={setActiveTab} />
+        <MobileBottomNav 
+          activeTab={activeTab} 
+          onSelectTab={setActiveTab}
+          uiMode={uiMode}
+          onToggleUiMode={handleToggleUiMode}
+        />
         
-        {/* Modals & Drawers */}
-        <SimulationModal isOpen={isSimulationModalOpen} simulation={simulationResult} onClose={() => setIsSimulationModalOpen(false)} network={currentNetwork} onBroadcastToRelay={handleBroadcastFromSimulation} operationalGasWallet={operationalGasWallets[currentNetwork.id]} onOpenGasStrategy={() => setIsGasStrategyModalOpen(true)} />
-        <SideDrawer isOpen={isNetworkModalOpen} onClose={() => setIsNetworkModalOpen(false)} title="Network & RPC Manager">
-          <NetworkManagerModal isOpen={true} onClose={() => setIsNetworkModalOpen(false)} currentNetwork={currentNetwork} onSelectNetwork={handleSelectNetwork} onUpdateNetworkConfig={handleUpdateNetworkConfig} />
+        {/* Modals & Hardware-Accelerated Side Drawers */}
+        <SimulationModal 
+          isOpen={isSimulationModalOpen} 
+          simulation={simulationResult} 
+          onClose={() => setIsSimulationModalOpen(false)} 
+          network={currentNetwork} 
+          onBroadcastToRelay={handleBroadcastFromSimulation} 
+          operationalGasWallet={operationalGasWallets[currentNetwork.id]} 
+          onOpenGasStrategy={() => setIsGasStrategyModalOpen(true)} 
+        />
+
+        <SideDrawer 
+          isOpen={isNetworkModalOpen} 
+          onClose={() => setIsNetworkModalOpen(false)} 
+          title="Network & RPC Failover Engine"
+          subtitle="Live RPC latency telemetry, Aave V3 Core Pool & private MEV relays"
+        >
+          <NetworkManagerModal 
+            embedded={true}
+            isOpen={true} 
+            onClose={() => setIsNetworkModalOpen(false)} 
+            currentNetwork={currentNetwork} 
+            onSelectNetwork={handleSelectNetwork} 
+            onUpdateNetworkConfig={handleUpdateNetworkConfig} 
+          />
         </SideDrawer>
-        <SideDrawer isOpen={isStrategyModalOpen} onClose={() => setIsStrategyModalOpen(false)} title="Strategy Templates">
-          <StrategyManagerModal isOpen={true} onClose={() => setIsStrategyModalOpen(false)} strategies={strategies} onSelectStrategy={handleLoadStrategyIntoBuilder} onDeleteStrategy={handleDeleteStrategy} onImportStrategies={handleImportStrategies} network={currentNetwork} />
+
+        <SideDrawer 
+          isOpen={isStrategyModalOpen} 
+          onClose={() => setIsStrategyModalOpen(false)} 
+          title="Arbitrage Strategy Templates"
+          subtitle="Export, import, and 1-click load pre-computed routes into builder"
+        >
+          <StrategyManagerModal 
+            embedded={true}
+            isOpen={true} 
+            onClose={() => setIsStrategyModalOpen(false)} 
+            strategies={strategies} 
+            onSelectStrategy={handleLoadStrategyIntoBuilder} 
+            onDeleteStrategy={handleDeleteStrategy} 
+            onImportStrategies={handleImportStrategies} 
+            network={currentNetwork} 
+          />
         </SideDrawer>
-        <SideDrawer isOpen={isRiskModalOpen} onClose={() => setIsRiskModalOpen(false)} title="Risk Alerts & Thresholds">
-          <RiskThresholdModal isOpen={true} onClose={() => setIsRiskModalOpen(false)} criteria={riskCriteria} onUpdateCriteria={setRiskCriteria} currentGasPriceGwei={currentNetwork.baseFeeGwei + currentNetwork.priorityFeeGwei} opportunities={opportunities} currentNetwork={currentNetwork} />
+
+        <SideDrawer 
+          isOpen={isRiskModalOpen} 
+          onClose={() => setIsRiskModalOpen(false)} 
+          title="Risk Alert & Circuit Breakers"
+          subtitle="Dynamic slippage protection, min net profit filters & gas spike alerts"
+        >
+          <RiskThresholdModal 
+            embedded={true}
+            isOpen={true} 
+            onClose={() => setIsRiskModalOpen(false)} 
+            criteria={riskCriteria} 
+            onUpdateCriteria={setRiskCriteria} 
+            currentGasPriceGwei={currentNetwork.baseFeeGwei + currentNetwork.priorityFeeGwei} 
+            opportunities={opportunities} 
+            currentNetwork={currentNetwork} 
+          />
         </SideDrawer>
-        <Phase1GasStrategyModal isOpen={isGasStrategyModalOpen} onClose={() => setIsGasStrategyModalOpen(false)} currentNetwork={currentNetwork} onSelectNetwork={handleSelectNetwork} operationalGasWallets={operationalGasWallets} onTopUpGasWallet={handleTopUpGasWallet} />
+
+        <Phase1GasStrategyModal 
+          isOpen={isGasStrategyModalOpen} 
+          onClose={() => setIsGasStrategyModalOpen(false)} 
+          currentNetwork={currentNetwork} 
+          onSelectNetwork={handleSelectNetwork} 
+          operationalGasWallets={operationalGasWallets} 
+          onTopUpGasWallet={handleTopUpGasWallet} 
+        />
       </div>
     </ToastProvider>
   );

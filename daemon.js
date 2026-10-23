@@ -32,7 +32,15 @@ const FALLBACK_RPCS = [
 let activeRpcIndex = 0;
 const PRIVATE_KEY = process.env.BOT_PRIVATE_KEY || "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const CONTRACT_ADDRESS = process.env.DEPLOYED_ARBITRAGE_CONTRACT || "0x8382FfDe655848C06C59FE6b6819445Fa191392A";
-const RELAY_ENDPOINT = process.env.MEV_RELAY_URL || "https://rpc.flashbots.net";
+
+// Private MEV Relay Endpoints (Flashbots Protect & bloXroute Cloud)
+const MEV_RELAYS = [
+  process.env.MEV_RELAY_URL || "https://relay.flashbots.net",
+  process.env.BLOXROUTE_RELAY_URL || "https://mev.api.blxrbdn.com",
+  "https://rpc.flashbots.net"
+];
+let activeRelayIndex = 0;
+
 const MIN_PROFIT_THRESHOLD_ETH = process.env.MIN_PROFIT_ETH || "0.015";
 const MEV_BRIBE_BPS = parseInt(process.env.MEV_BRIBE_BPS || "50", 10); // 0.5% MEV builder tip (50 bps)
 const DRY_RUN = process.env.DRY_RUN === "true" || process.argv.includes("--dry-run");
@@ -40,14 +48,14 @@ const HEALTH_PORT = parseInt(process.env.HEALTH_PORT || "8080", 10);
 const MAX_GAS_SPIKE_GWEI = parseFloat(process.env.MAX_GAS_SPIKE_GWEI || "150");
 
 console.log("==================================================================");
-console.log("   ENTERPRISE FLASH LOAN MEV DAEMON V1.1.0 (SMART FAILOVER)       ");
+console.log("   ENTERPRISE FLASH LOAN MEV DAEMON V1.1.0 (MULTI-RELAY FAILOVER) ");
 console.log("==================================================================");
 console.log(`[DAEMON INIT] Node Environment: ${process.env.NODE_ENV || 'production'}`);
 console.log(`[DAEMON INIT] Mode: ${DRY_RUN ? 'DRY-RUN (Simulations only)' : 'LIVE EXECUTION'}`);
 console.log(`[DAEMON INIT] Active RPC: ${FALLBACK_RPCS[0]}`);
 console.log(`[DAEMON INIT] Fallback Endpoints: ${FALLBACK_RPCS.length} registered`);
 console.log(`[DAEMON INIT] Contract Address: ${CONTRACT_ADDRESS}`);
-console.log(`[DAEMON INIT] MEV Relay Endpoint: ${RELAY_ENDPOINT}`);
+console.log(`[DAEMON INIT] MEV Relays: ${MEV_RELAYS.join(", ")}`);
 console.log(`[DAEMON INIT] Min Profit Threshold: ${MIN_PROFIT_THRESHOLD_ETH} ETH`);
 console.log(`[DAEMON INIT] MEV Bribe: ${MEV_BRIBE_BPS} BPS (${MEV_BRIBE_BPS / 100}%)`);
 console.log("==================================================================");
@@ -61,13 +69,15 @@ let privateWallet;
 let privateContract;
 
 const ABI = [
+  "function requestFlashLoan(address asset, uint256 amount, bytes calldata params) external",
   "function executeArbitrage(address asset, uint256 amount, bytes calldata params) external",
+  "function aavePool() external view returns (address)",
   "function AAVE_POOL() external view returns (address)",
   "function maxLoanLimit() external view returns (uint256)",
   "function maxGasPriceThreshold() external view returns (uint256)",
-  "function pause() external",
-  "function unpause() external",
-  "event ArbitrageExecuted(address indexed asset, uint256 loanAmount, uint256 totalRepayment, uint256 netProfit)"
+  "function withdrawToken(address token, uint256 amount) external",
+  "function withdrawNative(uint256 amount) external",
+  "event ArbitrageExecuted(address indexed asset, uint256 borrowedAmount, uint256 totalRepayment, uint256 grossProfit, uint256 mevBribePaid, uint256 netProfit)"
 ];
 
 // Lightweight internal metrics
@@ -99,12 +109,14 @@ function initWeb3() {
     wallet = new ethers.Wallet(PRIVATE_KEY, provider);
     botContract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
 
-    // Private Provider for MEV Relay (Bypasses Public Mempool)
-    privateProvider = new ethers.JsonRpcProvider(RELAY_ENDPOINT);
+    // Private Provider for MEV Relay (Bypasses Public Mempool via Flashbots/bloXroute)
+    const activeRelay = MEV_RELAYS[activeRelayIndex] || "https://rpc.flashbots.net";
+    privateProvider = new ethers.JsonRpcProvider(activeRelay);
     privateWallet = wallet.connect(privateProvider);
     privateContract = botContract.connect(privateWallet);
 
     console.log(`[DAEMON ACTIVE] Connected to RPC [${activeRpcIndex + 1}/${FALLBACK_RPCS.length}]: ${targetUrl}`);
+    console.log(`[DAEMON ACTIVE] Connected to MEV Relay [${activeRelayIndex + 1}/${MEV_RELAYS.length}]: ${activeRelay}`);
   } catch (err) {
     console.warn(`[FAILOVER TRIGGER] Connection failed on ${targetUrl}: ${err.message}`);
     triggerRpcFailover();
@@ -125,6 +137,22 @@ function triggerRpcFailover() {
 }
 
 /**
+ * Automated failover switch for MEV Relays (Flashbots <-> bloXroute)
+ */
+function triggerRelayFailover() {
+  activeRelayIndex = (activeRelayIndex + 1) % MEV_RELAYS.length;
+  const nextRelay = MEV_RELAYS[activeRelayIndex];
+  console.log(`[RELAY FAILOVER] Switching to alternate MEV relay [${activeRelayIndex + 1}/${MEV_RELAYS.length}]: ${nextRelay}`);
+  try {
+    privateProvider = new ethers.JsonRpcProvider(nextRelay);
+    privateWallet = wallet.connect(privateProvider);
+    privateContract = botContract.connect(privateWallet);
+  } catch (err) {
+    console.warn(`[RELAY ERROR] Failed switching relay: ${err.message}`);
+  }
+}
+
+/**
  * Evaluates an opportunity, performs dry-run staticCall simulation,
  * calculates dynamic EIP-1559 gas params, and submits to MEV relay.
  */
@@ -133,26 +161,50 @@ export async function evaluateAndExecute(opportunity) {
   const startTime = Date.now();
 
   try {
-    const { asset, borrowAmount, minProfit, steps } = opportunity;
-
+    const { asset, borrowAmount, minProfit, calls, steps } = opportunity;
     const abiCoder = new ethers.AbiCoder();
-    const encodedParams = abiCoder.encode(
-      [
-        "tuple(uint256 minProfit, uint256 mevBribeBps, tuple(uint8 protocol, address targetContract, address tokenIn, address tokenOut, uint24 v3Fee, bytes32 balancerPoolId, uint256 minAmountOut, uint256 slippageToleranceBps)[] steps)"
-      ],
-      [{ minProfit, mevBribeBps: MEV_BRIBE_BPS, steps }] // 0.5% MEV builder tip
-    );
+    let encodedParams;
 
-    // 1. Mandatory Local Static Call Simulation (Dry-Run)
+    // Polymorphic Call[] encoding for EnterpriseFlashLoan.sol
+    if (calls && calls.length > 0) {
+      encodedParams = abiCoder.encode(
+        [
+          "tuple(uint256 minProfit, uint256 mevBribeBps, tuple(address target, address approveToken, uint256 approveAmount, bytes callData)[] calls)"
+        ],
+        [{ minProfit, mevBribeBps: MEV_BRIBE_BPS, calls }]
+      );
+    } else if (steps && steps.length > 0) {
+      // Legacy or structured steps tuple encoding
+      encodedParams = abiCoder.encode(
+        [
+          "tuple(uint256 minProfit, uint256 mevBribeBps, tuple(uint8 protocol, address targetContract, address tokenIn, address tokenOut, uint24 v3Fee, bytes32 balancerPoolId, uint256 minAmountOut, uint256 slippageToleranceBps)[] steps)"
+        ],
+        [{ minProfit, mevBribeBps: MEV_BRIBE_BPS, steps }]
+      );
+    } else {
+      throw new Error("Invalid opportunity payload: missing calls or steps");
+    }
+
+    // 1. Mandatory Local Static Call Simulation (Dry-Run via eth_call)
     // Protects against wasting gas on unviable transactions or frontrunning slippage
-    console.log(`[SIMULATION] Running eth_call dry-run on ${asset.slice(0, 8)}... Borrow: ${ethers.formatUnits(borrowAmount, 18)}`);
-    await botContract.executeArbitrage.staticCall(asset, borrowAmount, encodedParams);
+    console.log(`[SIMULATION] Running eth_call dry-run on ${asset.slice(0, 10)}... Borrow: ${ethers.formatUnits(borrowAmount, 18)}`);
+
+    try {
+      await botContract.requestFlashLoan.staticCall(asset, borrowAmount, encodedParams);
+    } catch (simErr) {
+      // Fallback check on executeArbitrage interface if available
+      if (typeof botContract.executeArbitrage?.staticCall === "function") {
+        await botContract.executeArbitrage.staticCall(asset, borrowAmount, encodedParams);
+      } else {
+        throw simErr;
+      }
+    }
     
     metrics.simulationsPassed++;
-    console.log("[SIMULATION PASSED] Profitable arbitrage route verified.");
+    console.log("[SIMULATION PASSED] Profitable arbitrage route verified via eth_call.");
 
     if (DRY_RUN) {
-      console.log("[DRY RUN ACTIVE] Skipping broadcast to private relay.");
+      console.log("[DRY RUN ACTIVE] Opportunity profitable. Skipping private broadcast.");
       return { success: true, dryRun: true };
     }
 
@@ -165,14 +217,34 @@ export async function evaluateAndExecute(opportunity) {
     console.log(`[GAS OPTIMIZATION] baseFee: ${ethers.formatUnits(baseFee, "gwei")} gwei | maxPriority: ${ethers.formatUnits(maxPriorityFeePerGas, "gwei")} gwei`);
 
     // 3. Route through Private Relay (MEV Protection)
-    console.log("[EXECUTING] Broadcasting atomic flash loan bundle...");
+    console.log(`[EXECUTING] Broadcasting atomic flash loan bundle via ${MEV_RELAYS[activeRelayIndex]}...`);
     metrics.broadcastCount++;
 
-    const tx = await privateContract.executeArbitrage(asset, borrowAmount, encodedParams, {
-      gasLimit: 2_000_000,
-      maxPriorityFeePerGas,
-      maxFeePerGas
-    });
+    let tx;
+    try {
+      if (typeof privateContract.requestFlashLoan === "function") {
+        tx = await privateContract.requestFlashLoan(asset, borrowAmount, encodedParams, {
+          gasLimit: 2_500_000,
+          maxPriorityFeePerGas,
+          maxFeePerGas
+        });
+      } else {
+        tx = await privateContract.executeArbitrage(asset, borrowAmount, encodedParams, {
+          gasLimit: 2_500_000,
+          maxPriorityFeePerGas,
+          maxFeePerGas
+        });
+      }
+    } catch (relayErr) {
+      console.warn(`[RELAY BROADCAST WARNING] Relay failed (${relayErr.message}). Triggering relay failover...`);
+      triggerRelayFailover();
+      // Retry once on failover relay
+      tx = await privateContract.requestFlashLoan(asset, borrowAmount, encodedParams, {
+        gasLimit: 2_500_000,
+        maxPriorityFeePerGas,
+        maxFeePerGas
+      });
+    }
 
     console.log(`[SUCCESS] Transaction broadcasted! Hash: ${tx.hash}`);
     const receipt = await tx.wait();

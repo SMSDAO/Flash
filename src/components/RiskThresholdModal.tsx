@@ -31,6 +31,7 @@ interface RiskThresholdModalProps {
   currentGasPriceGwei: number;
   opportunities: MempoolOpportunity[];
   currentNetwork: NetworkConfig;
+  embedded?: boolean;
 }
 
 export const RiskThresholdModal: React.FC<RiskThresholdModalProps> = ({
@@ -40,7 +41,8 @@ export const RiskThresholdModal: React.FC<RiskThresholdModalProps> = ({
   onUpdateCriteria,
   currentGasPriceGwei,
   opportunities,
-  currentNetwork
+  currentNetwork,
+  embedded = false
 }) => {
   const [localCriteria, setLocalCriteria] = useState<RiskAlertCriteria>(criteria);
   const [notificationStatus, setNotificationStatus] = useState<string>(
@@ -87,68 +89,33 @@ export const RiskThresholdModal: React.FC<RiskThresholdModalProps> = ({
     evaluateOpportunityAgainstRiskCriteria(opp, localCriteria, currentGasPriceGwei).matches
   );
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm font-mono overflow-y-auto">
-      <div className="bg-[#090b10] border border-cyan-800/80 w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden flex flex-col my-auto max-h-[92vh]">
-        {/* Modal Header */}
-        <div className="px-6 py-4 bg-gradient-to-r from-slate-950 via-[#0d131f] to-slate-950 border-b border-slate-800 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-cyan-950 border border-cyan-500/40 flex items-center justify-center text-cyan-400">
-              <ShieldCheck className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h3 className="text-base font-bold text-white tracking-wide">
-                  MEV Risk Threshold & Alert Engine
-                </h3>
-                <span className={`text-[10px] px-2 py-0.5 rounded-full uppercase font-bold border ${
-                  localCriteria.enabled 
-                    ? 'bg-emerald-950/80 text-emerald-300 border-emerald-700/60' 
-                    : 'bg-rose-950/80 text-rose-300 border-rose-700/60'
-                }`}>
-                  {localCriteria.enabled ? 'Active Monitoring' : 'Disabled'}
-                </span>
-              </div>
-              <p className="text-xs text-slate-400 mt-0.5">
-                Multi-factor risk filters for real-time opportunity discovery & automated notifications
-              </p>
-            </div>
+  if (embedded) {
+    return (
+      <div className="space-y-6 font-mono text-xs">
+        {/* Master Enable/Disable Switch */}
+        <div className="flex items-center justify-between p-4 rounded-xl bg-slate-900/60 border border-slate-800">
+          <div>
+            <span className="text-sm font-semibold text-white block">Real-Time Risk Alert Daemon</span>
+            <span className="text-slate-400 text-[11px]">
+              Filter incoming mempool stream and trigger immediate synthesized chimes and notifications.
+            </span>
           </div>
-
           <button
-            onClick={onClose}
-            className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 hover:bg-slate-800 text-slate-400 hover:text-white transition-colors"
+            onClick={() => setLocalCriteria(c => ({ ...c, enabled: !c.enabled }))}
+            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${
+              localCriteria.enabled ? 'bg-cyan-500' : 'bg-slate-700'
+            }`}
           >
-            <X className="w-4 h-4" />
+            <span
+              className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                localCriteria.enabled ? 'translate-x-6' : 'translate-x-1'
+              }`}
+            />
           </button>
         </div>
 
-        {/* Modal Body */}
-        <div className="p-6 space-y-6 overflow-y-auto flex-1 text-xs">
-          {/* Master Enable/Disable Switch */}
-          <div className="flex items-center justify-between p-4 rounded-xl bg-slate-900/60 border border-slate-800">
-            <div>
-              <span className="text-sm font-semibold text-white block">Real-Time Risk Alert Daemon</span>
-              <span className="text-slate-400 text-[11px]">
-                Filter incoming mempool stream and trigger immediate synthesized chimes and notifications.
-              </span>
-            </div>
-            <button
-              onClick={() => setLocalCriteria(c => ({ ...c, enabled: !c.enabled }))}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${
-                localCriteria.enabled ? 'bg-cyan-500' : 'bg-slate-700'
-              }`}
-            >
-              <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                  localCriteria.enabled ? 'translate-x-6' : 'translate-x-1'
-                }`}
-              />
-            </button>
-          </div>
-
-          {/* Grid of Risk Parameters */}
-          <div className="space-y-5">
+        {/* Grid of Risk Parameters */}
+        <div className="space-y-5">
             {/* 1. Min Net Profit Threshold */}
             <div className="space-y-2 bg-[#0c1017] p-4 rounded-xl border border-slate-800">
               <div className="flex items-center justify-between">
@@ -419,15 +386,14 @@ export const RiskThresholdModal: React.FC<RiskThresholdModalProps> = ({
                 {matchingOpps.length > 0 ? 'PASSING' : 'FILTERING STRICT'}
               </span>
             </div>
-          </div>
         </div>
 
-        {/* Modal Footer */}
-        <div className="px-6 py-4 bg-slate-950 border-t border-slate-800 flex items-center justify-between">
+        {/* Footer */}
+        <div className="pt-4 border-t border-slate-800/80 flex items-center justify-between">
           <button
             type="button"
             onClick={handleReset}
-            className="px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 hover:bg-slate-800 text-slate-400 hover:text-white text-xs flex items-center gap-1.5 transition-colors"
+            className="px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 hover:bg-slate-800 text-slate-400 hover:text-white text-xs flex items-center gap-1.5 transition-colors cursor-pointer"
           >
             <RotateCcw className="w-3.5 h-3.5" />
             <span>Reset Defaults</span>
@@ -437,19 +403,36 @@ export const RiskThresholdModal: React.FC<RiskThresholdModalProps> = ({
             <button
               type="button"
               onClick={onClose}
-              className="px-4 py-1.5 rounded-lg bg-slate-900 border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs transition-colors"
+              className="px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 hover:bg-slate-800 text-slate-300 text-xs transition-colors cursor-pointer"
             >
               Cancel
             </button>
             <button
               type="button"
               onClick={handleSave}
-              className="px-4 py-1.5 rounded-lg bg-gradient-to-r from-cyan-600 to-indigo-600 hover:from-cyan-500 hover:to-indigo-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-lg shadow-cyan-500/20 transition-all cursor-pointer"
+              className="px-4 py-1.5 rounded-lg bg-gradient-to-r from-cyan-600 to-indigo-600 hover:from-cyan-500 hover:to-indigo-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-md shadow-cyan-950 transition-all cursor-pointer"
             >
               <Check className="w-3.5 h-3.5" />
               <span>Apply Risk Filter</span>
             </button>
           </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm font-mono overflow-y-auto text-xs">
+      <div className="bg-[#090b10] border border-cyan-800/80 w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden flex flex-col my-auto max-h-[92vh]">
+        <div className="px-6 py-4 bg-slate-950 border-b border-slate-800 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <ShieldCheck className="w-5 h-5 text-cyan-400" />
+            <h3 className="text-sm font-bold text-white">MEV Risk Thresholds</h3>
+          </div>
+          <button onClick={onClose} className="p-1 text-slate-400 hover:text-white"><X className="w-4 h-4" /></button>
+        </div>
+        <div className="p-4">
+          <button onClick={onClose} className="px-4 py-2 bg-cyan-600 text-white rounded">Close</button>
         </div>
       </div>
     </div>

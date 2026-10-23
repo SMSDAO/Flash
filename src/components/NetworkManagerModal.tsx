@@ -23,6 +23,7 @@ interface NetworkManagerModalProps {
   currentNetwork: NetworkConfig;
   onSelectNetwork: (networkId: NetworkId) => void;
   onUpdateNetworkConfig: (networkId: NetworkId, updates: Partial<NetworkConfig>) => void;
+  embedded?: boolean;
 }
 
 export const NetworkManagerModal: React.FC<NetworkManagerModalProps> = ({
@@ -30,7 +31,8 @@ export const NetworkManagerModal: React.FC<NetworkManagerModalProps> = ({
   onClose,
   currentNetwork,
   onSelectNetwork,
-  onUpdateNetworkConfig
+  onUpdateNetworkConfig,
+  embedded = false
 }) => {
   const [activeNetworkId, setActiveNetworkId] = useState<NetworkId>(currentNetwork.id);
   const [rpcUrlInput, setRpcUrlInput] = useState<string>(currentNetwork.rpcUrl);
@@ -89,28 +91,15 @@ export const NetworkManagerModal: React.FC<NetworkManagerModalProps> = ({
     n.chainId.toString().includes(chainlistSearch)
   );
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm font-mono text-xs">
-      <div className="bg-[#0c1017] border border-slate-800 rounded-2xl w-full max-w-2xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
-        {/* Header */}
-        <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between bg-slate-950">
-          <div className="flex items-center gap-2">
-            <Globe className="w-4 h-4 text-cyan-400" />
-            <h3 className="text-sm font-bold text-white">Network & RPC Endpoint Management</h3>
-          </div>
-          <button onClick={onClose} className="text-slate-400 hover:text-white p-1">
-            <X className="w-5 h-5" />
-          </button>
-        </div>
-
-        {/* Body */}
-        <div className="p-5 space-y-5 overflow-y-auto flex-1">
-          {/* Chainlist Network Selector */}
-          <div>
-            <label className="block text-slate-400 text-xs mb-1.5 flex items-center justify-between">
-              <span>Select EVM Blockchain Network (Chainlist Registry)</span>
-              <span className="text-cyan-400 text-[10px]">Verified Aave V3 Deployments</span>
-            </label>
+  if (embedded) {
+    return (
+      <div className="space-y-5 font-mono text-xs">
+        {/* Chainlist Network Selector */}
+        <div>
+          <label className="block text-slate-400 text-xs mb-1.5 flex items-center justify-between">
+            <span>Select EVM Blockchain (Chainlist)</span>
+            <span className="text-cyan-400 text-[10px]">Verified Aave V3</span>
+          </label>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {filteredNetworks.map(net => {
                 const relays = relayLatencies[net.id] || [];
@@ -269,29 +258,51 @@ export const NetworkManagerModal: React.FC<NetworkManagerModalProps> = ({
               />
             </div>
           </div>
-        </div>
 
         {/* Footer */}
-        <div className="px-5 py-3 border-t border-slate-800 bg-slate-950 flex items-center justify-between">
+        <div className="pt-4 border-t border-slate-800/80 flex items-center justify-between">
           <div className="text-[11px] text-slate-500">
-            Stored in persistent browser storage
+            Stored in persistent storage
           </div>
 
           <div className="flex items-center gap-2">
             <button
               onClick={onClose}
-              className="px-3 py-1.5 rounded-lg bg-slate-900 text-slate-400 hover:text-white"
+              className="px-3 py-1.5 rounded-lg bg-slate-900 text-slate-400 hover:text-white cursor-pointer"
             >
               Cancel
             </button>
             <button
               onClick={handleSave}
-              className="px-4 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-bold flex items-center gap-1.5"
+              className="px-4 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-bold flex items-center gap-1.5 cursor-pointer shadow-md shadow-cyan-950"
             >
               {savedSuccess ? <Check className="w-3.5 h-3.5" /> : <Save className="w-3.5 h-3.5" />}
               <span>{savedSuccess ? 'Saved & Activated' : 'Save & Switch Network'}</span>
             </button>
           </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm font-mono text-xs">
+      <div className="bg-[#0c1017] border border-slate-800 rounded-2xl w-full max-w-2xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
+        {/* Header */}
+        <div className="px-5 py-4 border-b border-slate-800 flex items-center justify-between bg-slate-950">
+          <div className="flex items-center gap-2">
+            <Globe className="w-4 h-4 text-cyan-400" />
+            <h3 className="text-sm font-bold text-white">Network & RPC Endpoint Management</h3>
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-white p-1">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Footer */}
+        <div className="px-5 py-3 border-t border-slate-800 bg-slate-950 flex items-center justify-between">
+          <div className="text-[11px] text-slate-500">Stored in browser storage</div>
+          <button onClick={onClose} className="px-3 py-1.5 rounded-lg bg-slate-900 text-slate-400 hover:text-white">Close</button>
         </div>
       </div>
     </div>

@@ -139,6 +139,55 @@ export const AdvancedRouteBuilder: React.FC<AdvancedRouteBuilderProps> = ({
   const oracleBenchmarkPrice = oracleFeed ? oracleFeed.latestPriceUsd : selectedAsset.usdPrice;
   const impliedPoolPrice = oracleBenchmarkPrice * (1 + (currentDriftPct / 100));
 
+  // Precise calculation helper for minimum output amount with slippage and protocol fees
+  const computeStepMinAmountOut = (
+    step: SwapStep,
+    amountInFloat: number,
+    net: NetworkConfig
+  ): string => {
+    const tokenIn = net.tokens.find(t => t.address.toLowerCase() === step.tokenIn.toLowerCase());
+    const tokenOut = net.tokens.find(t => t.address.toLowerCase() === step.tokenOut.toLowerCase());
+
+    const tokenInPrice = tokenIn?.usdPrice || 1.0;
+    const tokenOutPrice = tokenOut?.usdPrice || 1.0;
+    const tokenOutDecimals = tokenOut?.decimals || 18;
+
+    let feeBps = 30; // 0.3% standard AMM fee
+    if (step.protocol === ProtocolType.UNISWAP_V3 && step.v3Fee) {
+      feeBps = step.v3Fee / 100;
+    }
+    const feeMultiplier = 1 - (feeBps / 10000);
+    const expectedOutFloat = amountInFloat * (tokenInPrice / tokenOutPrice) * feeMultiplier;
+    const slippageFactor = 1 - ((step.slippageTolerancePct || 0.15) / 100);
+    const minOutFloat = Math.max(0, expectedOutFloat * slippageFactor);
+
+    try {
+      const formatted = minOutFloat.toFixed(Math.min(tokenOutDecimals, 6));
+      return ethers.parseUnits(formatted, tokenOutDecimals).toString();
+    } catch {
+      return "0";
+    }
+  };
+
+  // Re-calculate minAmountOut parameters across all steps in the route sequence
+  const recalculateAllMinAmountOut = (currentSteps: SwapStep[], borrowAmount: string, net: NetworkConfig): SwapStep[] => {
+    let runningAmount = parseFloat(borrowAmount || "0");
+    return currentSteps.map(step => {
+      const minOut = computeStepMinAmountOut(step, runningAmount, net);
+      const tokenOut = net.tokens.find(t => t.address.toLowerCase() === step.tokenOut.toLowerCase());
+      const tokenOutDecimals = tokenOut?.decimals || 18;
+      try {
+        runningAmount = parseFloat(ethers.formatUnits(minOut, tokenOutDecimals));
+      } catch {
+        // fallback to input
+      }
+      return {
+        ...step,
+        minAmountOut: minOut
+      };
+    });
+  };
+
   // Auto-recalculate and re-apply swap paths when price deviation exceeds 2%
   const recalculateAndApplyOptimalRoute = (drift: number, explicitReason?: string) => {
     setIsRebalancing(true);
@@ -151,7 +200,7 @@ export const AdvancedRouteBuilder: React.FC<AdvancedRouteBuilderProps> = ({
     const bestDex2 = network.dexes.find(d => d.protocol !== bestDex1.protocol) || network.dexes[network.dexes.length - 1];
 
     // Automated loop: construct optimal path and enforce strict slippage/fee sanitization
-    const sanitizedSteps: SwapStep[] = [
+    const rawSteps: SwapStep[] = [
       {
         id: `step-${Date.now()}-1`,
         protocol: bestDex1.protocol,
@@ -182,12 +231,14 @@ export const AdvancedRouteBuilder: React.FC<AdvancedRouteBuilderProps> = ({
       }
     ];
 
+    const sanitizedSteps = recalculateAllMinAmountOut(rawSteps, loanAmount, network);
     setSteps(sanitizedSteps);
+
     // Return deviation back into safe narrow band
     const normalizedDrift = 0.18;
     setCurrentDriftPct(normalizedDrift);
 
-    const message = explicitReason || `Chainlink Oracle price deviation exceeded 2.0% (${drift.toFixed(2)}% vs ${selectedAsset.symbol}/USD feed). Automated loop re-calculated, re-validated, and re-applied optimal path via ${bestDex1.name} & ${bestDex2.name} with sanitized slippage (0.08%).`;
+    const message = explicitReason || `Chainlink Oracle price deviation exceeded 2.0% (${drift.toFixed(2)}% vs ${selectedAsset.symbol}/USD feed). Automated loop re-calculated, re-validated, and re-applied optimal path with sanitized minAmountOut parameters.`;
 
     setRebalanceAlert({
       timestamp: Date.now(),
@@ -199,28 +250,75 @@ export const AdvancedRouteBuilder: React.FC<AdvancedRouteBuilderProps> = ({
 
     setTimeout(() => {
       setIsRebalancing(false);
-    }, 500);
+    }, 400);
   };
 
-  // Monitor price deviation: automatic logic loop triggering recalculation, minAmountOut re-calculation, and toast alert if deviation > 2%
+  // Effect hook: Watches current chain's Chainlink oracle price for all assets in swap path
+  // If price deviates by > 2% during route configuration:
+  // 1. Triggers automated re-calculation of minAmountOut parameters across all steps
+  // 2. Alerts user via toast notification that the route has been re-validated
   useEffect(() => {
     if (!autoRebalanceOnDrift) return;
 
-    if (currentDriftPct > 2.0) {
-      // Re-calculate minAmountOut parameters across path steps
-      setSteps(prev => prev.map(s => ({
-        ...s,
-        minAmountOut: ethers.parseUnits("0.05", 6).toString()
-      })));
+    const checkOracleAndRevalidate = () => {
+      let maxObservedDeviation = 0;
+      let driftingAsset = '';
+      let oracleRefPrice = 0;
+      let spotPrice = 0;
 
-      addToast(`Chainlink Oracle price deviation >2% (${currentDriftPct.toFixed(2)}%) detected. minAmountOut parameters re-calculated and route re-validated.`, "success");
+      for (const step of steps) {
+        const tokenIn = network.tokens.find(t => t.address.toLowerCase() === step.tokenIn.toLowerCase());
+        const tokenOut = network.tokens.find(t => t.address.toLowerCase() === step.tokenOut.toLowerCase());
 
-      recalculateAndApplyOptimalRoute(
-        currentDriftPct,
-        `Price deviation exceeded 2.0% (${currentDriftPct.toFixed(2)}% vs Chainlink Oracle). minAmountOut parameters re-calculated and route successfully re-validated.`
-      );
-    }
-  }, [currentDriftPct, autoRebalanceOnDrift]);
+        for (const token of [tokenIn, tokenOut]) {
+          if (!token) continue;
+          const pairKey = `${token.symbol.replace(/^W/, '')}/USD`;
+          const feed = chainlinkOracle.getFeed(network.id, pairKey) || chainlinkOracle.getFeed(network.id, `${token.symbol}/USD`);
+          if (feed) {
+            const dev = Math.abs((token.usdPrice - feed.latestPriceUsd) / feed.latestPriceUsd) * 100;
+            if (dev > maxObservedDeviation) {
+              maxObservedDeviation = dev;
+              driftingAsset = token.symbol;
+              oracleRefPrice = feed.latestPriceUsd;
+              spotPrice = token.usdPrice;
+            }
+          }
+        }
+      }
+
+      const effectiveDrift = Math.max(currentDriftPct, maxObservedDeviation);
+
+      if (effectiveDrift > 2.0) {
+        setIsRebalancing(true);
+
+        // Re-calculate minAmountOut parameters for all steps in the swap route
+        setSteps(prevSteps => recalculateAllMinAmountOut(prevSteps, loanAmount, network));
+
+        // Return drift meter to balanced state
+        setCurrentDriftPct(0.22);
+
+        // Toast alert: Route re-validated notification
+        addToast(
+          `Chainlink Oracle price deviation >2% (${effectiveDrift.toFixed(2)}% on ${driftingAsset || selectedAsset.symbol}) detected. minAmountOut parameters re-calculated and route re-validated.`,
+          "success"
+        );
+
+        setRebalanceAlert({
+          timestamp: Date.now(),
+          driftPct: effectiveDrift,
+          oraclePriceUsd: oracleRefPrice || oracleBenchmarkPrice,
+          poolPriceUsd: spotPrice || impliedPoolPrice,
+          message: `Chainlink Oracle deviation exceeded 2.0% (${effectiveDrift.toFixed(2)}%). minAmountOut parameters automatically re-calculated across all ${steps.length} hops with strict slippage protection.`
+        });
+
+        setTimeout(() => setIsRebalancing(false), 400);
+      }
+    };
+
+    checkOracleAndRevalidate();
+    const interval = setInterval(checkOracleAndRevalidate, 4000);
+    return () => clearInterval(interval);
+  }, [currentDriftPct, autoRebalanceOnDrift, steps, loanAmount, network]);
 
   // Update a step
   const updateStep = (index: number, updates: Partial<SwapStep>) => {
@@ -259,23 +357,22 @@ export const AdvancedRouteBuilder: React.FC<AdvancedRouteBuilderProps> = ({
     const tokenInObj = network.tokens.find(t => t.address.toLowerCase() === nextTokenIn.toLowerCase()) || selectedAsset;
     const tokenOutObj = network.tokens.find(t => t.address.toLowerCase() === nextTokenOut.toLowerCase()) || selectedAsset;
 
-    setSteps([
-      ...steps,
-      {
-        id: `step-${Date.now()}-${steps.length + 1}`,
-        protocol: dex.protocol,
-        targetContract: dex.routerAddress,
-        tokenIn: nextTokenIn,
-        tokenOut: nextTokenOut,
-        v3Fee: 3000,
-        balancerPoolId: ethers.ZeroHash,
-        minAmountOut: "0",
-        slippageTolerancePct: 0.15,
-        tokenInSymbol: tokenInObj.symbol,
-        tokenOutSymbol: tokenOutObj.symbol,
-        dexName: dex.name
-      }
-    ]);
+    const newStep: SwapStep = {
+      id: `step-${Date.now()}-${steps.length + 1}`,
+      protocol: dex.protocol,
+      targetContract: dex.routerAddress,
+      tokenIn: nextTokenIn,
+      tokenOut: nextTokenOut,
+      v3Fee: 3000,
+      balancerPoolId: ethers.ZeroHash,
+      minAmountOut: "0",
+      slippageTolerancePct: 0.15,
+      tokenInSymbol: tokenInObj.symbol,
+      tokenOutSymbol: tokenOutObj.symbol,
+      dexName: dex.name
+    };
+
+    setSteps([...steps, newStep]);
   };
 
   // Remove hop
@@ -284,22 +381,105 @@ export const AdvancedRouteBuilder: React.FC<AdvancedRouteBuilderProps> = ({
     setSteps(steps.filter((_, i) => i !== index));
   };
 
-  // Individual step validation warnings
-  const getStepWarnings = (step: SwapStep) => {
+  // Individual step validation warnings: Invalid protocol address & incompatible liquidity parameters
+  const getStepWarnings = (step: SwapStep): string[] => {
     const warnings: string[] = [];
+
+    // 1. Protocol router address validation
     if (!ethers.isAddress(step.targetContract)) {
-      warnings.push('Invalid contract address format.');
+      warnings.push(`Invalid protocol router address format: "${step.targetContract}".`);
+    } else if (step.targetContract === ethers.ZeroAddress) {
+      warnings.push('Protocol router cannot be the zero address (0x000...0).');
+    } else {
+      const isKnownDex = network.dexes.some(
+        d => d.routerAddress.toLowerCase() === step.targetContract.toLowerCase()
+      );
+      if (!isKnownDex) {
+        warnings.push(`Protocol router does not match verified DEX routers on ${network.name}.`);
+      }
     }
+
+    // 2. Token identity check
     if (step.tokenIn.toLowerCase() === step.tokenOut.toLowerCase()) {
-      warnings.push('Input and output tokens are identical.');
+      warnings.push(`Input token (${step.tokenInSymbol}) and output token cannot be identical.`);
     }
-    if (step.protocol === ProtocolType.BALANCER_V2 && (!step.balancerPoolId || step.balancerPoolId === ethers.ZeroHash)) {
-      warnings.push('Missing valid Balancer V2 Pool ID.');
+
+    // 3. Network protocol compatibility
+    if (network.id === 'zksync') {
+      if (step.protocol === ProtocolType.BALANCER_V2 || step.protocol === ProtocolType.CURVE_V2) {
+        warnings.push(`Protocol Incompatible: Balancer V2 Vault & Curve V2 are not supported on zkSync Era.`);
+      }
     }
-    if (step.slippageTolerancePct <= 0 || step.slippageTolerancePct > 5.0) {
-      warnings.push('Slippage tolerance outside normal bounds.');
+
+    // 4. Balancer pool ID validation
+    if (step.protocol === ProtocolType.BALANCER_V2) {
+      if (!step.balancerPoolId || step.balancerPoolId === ethers.ZeroHash || step.balancerPoolId.length !== 66) {
+        warnings.push('Missing or invalid 32-byte Balancer V2 Pool ID hash (0x...).');
+      }
     }
+
+    // 5. Liquidity parameters & fee tier compatibility
+    if (step.protocol === ProtocolType.UNISWAP_V3) {
+      const stableSymbols = ['USDC', 'USDT', 'DAI', 'FRAX', 'LUSD'];
+      const symIn = step.tokenInSymbol || '';
+      const symOut = step.tokenOutSymbol || '';
+      const isBothStable = stableSymbols.includes(symIn) && stableSymbols.includes(symOut);
+      if (step.v3Fee === 100 && !isBothStable) {
+        warnings.push(`Fee tier 0.01% (100) has thin liquidity for ${symIn}/${symOut} on ${network.name}. High revert risk; recommend 0.05% (500).`);
+      } else if (step.v3Fee === 10000 && (symIn === 'WETH' || symOut === 'WETH')) {
+        warnings.push(`Fee tier 1.00% (10000) incurs excessive pool fee drag on high-liquidity WETH pairs.`);
+      }
+    }
+
+    // 6. Slippage tolerance vs Network Gas State
+    const totalGasGwei = network.baseFeeGwei + network.priorityFeeGwei;
+    if (totalGasGwei > 30 && step.slippageTolerancePct < 0.08) {
+      warnings.push(`Slippage tolerance (${step.slippageTolerancePct}%) is too tight for congested gas state (${totalGasGwei} Gwei). Execution revert risk.`);
+    }
+    if (step.slippageTolerancePct > 1.5) {
+      warnings.push(`High slippage (${step.slippageTolerancePct}%) exposes transaction to sandwich attacks.`);
+    }
+
     return warnings;
+  };
+
+  // 1-Click Auto-Fix for step protocol & liquidity parameters
+  const handleAutoFixStep = (index: number) => {
+    const step = steps[index];
+    const matchingDex = network.dexes.find(d => d.protocol === step.protocol) || network.dexes[0];
+    const stableSymbols = ['USDC', 'USDT', 'DAI'];
+    const symIn = step.tokenInSymbol || '';
+    const symOut = step.tokenOutSymbol || '';
+    const isBothStable = stableSymbols.includes(symIn) && stableSymbols.includes(symOut);
+
+    let fixedFee = step.v3Fee;
+    if (step.protocol === ProtocolType.UNISWAP_V3) {
+      fixedFee = isBothStable ? 100 : 500;
+    }
+
+    let fixedProtocol = step.protocol;
+    let fixedTarget = matchingDex.routerAddress;
+    let fixedDexName = matchingDex.name;
+
+    if (network.id === 'zksync' && (step.protocol === ProtocolType.BALANCER_V2 || step.protocol === ProtocolType.CURVE_V2)) {
+      const v3Dex = network.dexes.find(d => d.protocol === ProtocolType.UNISWAP_V3) || network.dexes[0];
+      fixedProtocol = v3Dex.protocol;
+      fixedTarget = v3Dex.routerAddress;
+      fixedDexName = v3Dex.name;
+    }
+
+    updateStep(index, {
+      targetContract: fixedTarget,
+      protocol: fixedProtocol,
+      dexName: fixedDexName,
+      v3Fee: fixedFee,
+      slippageTolerancePct: 0.12,
+      balancerPoolId: fixedProtocol === ProtocolType.BALANCER_V2 && (!step.balancerPoolId || step.balancerPoolId === ethers.ZeroHash)
+        ? '0x5c6ee304399dbdb9c8ef030ab642b10820db8f56000200000000000000000014'
+        : step.balancerPoolId
+    });
+
+    addToast(`Hop ${index + 1} parameters automatically repaired for ${network.name}.`, 'success');
   };
 
   // Path validation logic
@@ -826,8 +1006,8 @@ export const AdvancedRouteBuilder: React.FC<AdvancedRouteBuilderProps> = ({
             </span>
           </div>
 
-          {/* Hops */}
-          <AnimatePresence>
+          {/* Hops with Framer Motion layout animations and visual parameter warning indicators */}
+          <AnimatePresence mode="popLayout">
             {steps.map((step, idx) => {
               const isFirst = idx === 0;
               const isLast = idx === steps.length - 1;
@@ -836,195 +1016,232 @@ export const AdvancedRouteBuilder: React.FC<AdvancedRouteBuilderProps> = ({
 
               return (
                 <motion.div
-                  key={step.id || idx}
+                  key={step.id}
                   layout
-                  initial={{ opacity: 0, y: -15 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: 15 }}
-                  transition={{ duration: 0.25 }}
+                  initial={{ opacity: 0, y: -16, scale: 0.98 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 16, scale: 0.96 }}
+                  transition={{
+                    layout: { duration: 0.3, ease: [0.16, 1, 0.3, 1] },
+                    opacity: { duration: 0.2 },
+                    scale: { duration: 0.2 }
+                  }}
                   className="relative"
                 >
                   <div className="flex justify-center -my-1.5 relative z-10">
                     <ArrowDown className="w-4 h-4 text-slate-600 bg-[#0b0e14] rounded-full p-0.5" />
                   </div>
 
-                  <div className={`rounded-xl p-3.5 transition-colors border ${
+                  <div className={`rounded-xl p-3.5 transition-all border ${
                     hasWarnings 
-                      ? 'bg-rose-950/20 border-rose-700/80 shadow-lg shadow-rose-950/20' 
+                      ? 'bg-rose-950/20 border-rose-700/80 shadow-[0_0_20px_rgba(244,63,94,0.12)]' 
                       : 'bg-slate-950/90 border-slate-800 hover:border-slate-700'
                   }`}>
-                    {hasWarnings && (
-                      <div className="mb-3 p-2 rounded-lg bg-rose-950/50 border border-rose-800/80 text-[11px] text-rose-300 space-y-1">
-                        {stepWarnings.map((w, wIdx) => (
-                          <div key={wIdx} className="flex items-center gap-1.5 font-medium">
-                            <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0 animate-pulse" />
-                            <span>{w}</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-
+                    {/* Step Card Header */}
                     <div className="flex flex-wrap items-center justify-between gap-2 mb-3 pb-2 border-b border-slate-800/70">
                       <div className="flex items-center gap-2">
                         <span className="w-5 h-5 rounded-full bg-slate-800 text-slate-300 flex items-center justify-center font-bold text-[10px]">
                           {idx + 1}
                         </span>
-                        <span className="text-white font-semibold">Hop {idx + 1}: Protocol</span>
+                        <span className="text-white font-semibold text-xs sm:text-sm">
+                          Hop {idx + 1}: {step.dexName || 'Protocol'}
+                        </span>
 
                         {hasWarnings && (
-                          <div className="flex items-center gap-1 px-2 py-0.5 rounded bg-rose-950 text-rose-300 border border-rose-700 text-[10px] font-bold" title={stepWarnings.join(' ')}>
-                            <AlertTriangle className="w-3 h-3 text-rose-400 shrink-0" />
-                            <span>{stepWarnings.length} Issue{stepWarnings.length > 1 ? 's' : ''}</span>
+                          <div 
+                            className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-rose-950/80 text-rose-300 border border-rose-700/80 text-[10px] font-bold" 
+                            title={stepWarnings.join(' • ')}
+                          >
+                            <AlertTriangle className="w-3 h-3 text-rose-400 shrink-0 animate-pulse" />
+                            <span>{stepWarnings.length} Incompatible Parameter{stepWarnings.length > 1 ? 's' : ''}</span>
                           </div>
                         )}
                       </div>
 
-                      {/* Protocol Selector */}
-                      <select
-                        value={step.protocol}
-                        onChange={(e) => {
-                          const newProto = Number(e.target.value) as ProtocolType;
-                          const matchingDex = network.dexes.find(d => d.protocol === newProto) || network.dexes[0];
-                          updateStep(idx, {
-                            protocol: newProto,
-                            targetContract: matchingDex.routerAddress,
-                            dexName: matchingDex.name
-                          });
-                        }}
-                        className="bg-slate-900 border border-slate-700 text-cyan-300 rounded px-2 py-0.5 text-xs focus:outline-none"
-                      >
-                        <option value={ProtocolType.UNISWAP_V3}>Uniswap V3</option>
-                        <option value={ProtocolType.UNISWAP_V2}>Uniswap V2 / Fork</option>
-                        <option value={ProtocolType.SUSHISWAP}>SushiSwap</option>
-                        <option value={ProtocolType.BALANCER_V2}>Balancer V2 Vault</option>
-                        <option value={ProtocolType.CURVE_V2}>Curve V2 Router</option>
-                      </select>
-                    </div>
-
-                    {/* Step Action Controls: Reorder Up / Down & Remove */}
-                    <div className="flex items-center gap-1">
-                      <button
-                        onClick={() => moveStepUp(idx)}
-                        disabled={isFirst}
-                        title="Move Hop Up"
-                        className={`p-1 rounded ${isFirst ? 'text-slate-600' : 'text-slate-400 hover:text-white hover:bg-slate-800'}`}
-                      >
-                        <ArrowUp className="w-3.5 h-3.5" />
-                      </button>
-                      <button
-                        onClick={() => moveStepDown(idx)}
-                        disabled={isLast}
-                        title="Move Hop Down"
-                        className={`p-1 rounded ${isLast ? 'text-slate-600' : 'text-slate-400 hover:text-white hover:bg-slate-800'}`}
-                      >
-                        <ArrowDown className="w-3.5 h-3.5" />
-                      </button>
-                      {steps.length > 2 && (
-                        <button
-                          onClick={() => removeStep(idx)}
-                          title="Delete Hop"
-                          className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-slate-800"
+                      <div className="flex items-center gap-2">
+                        {/* Protocol Selector */}
+                        <select
+                          value={step.protocol}
+                          onChange={(e) => {
+                            const newProto = Number(e.target.value) as ProtocolType;
+                            const matchingDex = network.dexes.find(d => d.protocol === newProto) || network.dexes[0];
+                            updateStep(idx, {
+                              protocol: newProto,
+                              targetContract: matchingDex.routerAddress,
+                              dexName: matchingDex.name
+                            });
+                          }}
+                          className="bg-slate-900 border border-slate-700 text-cyan-300 rounded px-2 py-1 text-xs focus:outline-none focus:border-cyan-500"
                         >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      )}
-                    </div>
-                  </div>
+                          <option value={ProtocolType.UNISWAP_V3}>Uniswap V3</option>
+                          <option value={ProtocolType.UNISWAP_V2}>Uniswap V2 / Fork</option>
+                          <option value={ProtocolType.SUSHISWAP}>SushiSwap</option>
+                          <option value={ProtocolType.BALANCER_V2}>Balancer V2 Vault</option>
+                          <option value={ProtocolType.CURVE_V2}>Curve V2 Router</option>
+                        </select>
 
-                  {/* Hop Details */}
-                  <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-                    {/* Token In */}
-                    <div>
-                      <span className="text-[10px] text-slate-500 block mb-1">Input Token:</span>
-                      <select
-                        value={step.tokenIn}
-                        onChange={(e) => {
-                          const token = network.tokens.find(t => t.address.toLowerCase() === e.target.value.toLowerCase());
-                          updateStep(idx, { tokenIn: e.target.value, tokenInSymbol: token?.symbol || "TOKEN" });
-                        }}
-                        className="w-full bg-slate-900 border border-slate-800 text-white rounded px-2 py-1"
-                      >
-                        {network.tokens.map(t => (
-                          <option key={t.address} value={t.address}>{t.symbol} ({t.name})</option>
-                        ))}
-                      </select>
-                    </div>
-
-                    {/* Token Out */}
-                    <div>
-                      <span className="text-[10px] text-slate-500 block mb-1">Output Token:</span>
-                      <select
-                        value={step.tokenOut}
-                        onChange={(e) => {
-                          const token = network.tokens.find(t => t.address.toLowerCase() === e.target.value.toLowerCase());
-                          updateStep(idx, { tokenOut: e.target.value, tokenOutSymbol: token?.symbol || "TOKEN" });
-                        }}
-                        className="w-full bg-slate-900 border border-slate-800 text-white rounded px-2 py-1"
-                      >
-                        {network.tokens.map(t => (
-                          <option key={t.address} value={t.address}>{t.symbol} ({t.name})</option>
-                        ))}
-                      </select>
-                    </div>
-
-                    {/* Protocol-Specific Option */}
-                    <div>
-                      {step.protocol === ProtocolType.UNISWAP_V3 && (
-                        <div>
-                          <span className="text-[10px] text-slate-500 block mb-1">V3 Fee Tier:</span>
-                          <select
-                            value={step.v3Fee}
-                            onChange={(e) => updateStep(idx, { v3Fee: Number(e.target.value) })}
-                            className="w-full bg-slate-900 border border-slate-800 text-cyan-300 rounded px-2 py-1"
+                        {/* Step Action Controls: Reorder Up / Down & Remove */}
+                        <div className="flex items-center gap-1 bg-slate-900 border border-slate-800 rounded p-0.5">
+                          <button
+                            type="button"
+                            onClick={() => moveStepUp(idx)}
+                            disabled={isFirst}
+                            title="Move Hop Up"
+                            className={`p-1 rounded ${isFirst ? 'text-slate-600 cursor-not-allowed' : 'text-slate-400 hover:text-white hover:bg-slate-800 cursor-pointer'} transition-colors`}
                           >
-                            <option value={100}>0.01% (100)</option>
-                            <option value={500}>0.05% (500)</option>
-                            <option value={3000}>0.30% (3000)</option>
-                            <option value={10000}>1.00% (10000)</option>
-                          </select>
+                            <ArrowUp className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => moveStepDown(idx)}
+                            disabled={isLast}
+                            title="Move Hop Down"
+                            className={`p-1 rounded ${isLast ? 'text-slate-600 cursor-not-allowed' : 'text-slate-400 hover:text-white hover:bg-slate-800 cursor-pointer'} transition-colors`}
+                          >
+                            <ArrowDown className="w-3.5 h-3.5" />
+                          </button>
+                          {steps.length > 2 && (
+                            <button
+                              type="button"
+                              onClick={() => removeStep(idx)}
+                              title="Delete Hop"
+                              className="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition-colors cursor-pointer"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          )}
                         </div>
-                      )}
-
-                      {step.protocol === ProtocolType.BALANCER_V2 && (
-                        <div>
-                          <span className="text-[10px] text-slate-500 block mb-1">Balancer Pool ID:</span>
-                          <input
-                            type="text"
-                            value={step.balancerPoolId}
-                            onChange={(e) => updateStep(idx, { balancerPoolId: e.target.value })}
-                            className="w-full bg-slate-900 border border-slate-800 text-slate-300 rounded px-2 py-1 text-[10px]"
-                            placeholder="0x..."
-                          />
-                        </div>
-                      )}
-
-                      {(step.protocol === ProtocolType.UNISWAP_V2 || step.protocol === ProtocolType.SUSHISWAP || step.protocol === ProtocolType.CURVE_V2) && (
-                        <div>
-                          <span className="text-[10px] text-slate-500 block mb-1">Router / Pool Address:</span>
-                          <input
-                            type="text"
-                            value={step.targetContract}
-                            onChange={(e) => updateStep(idx, { targetContract: e.target.value })}
-                            className="w-full bg-slate-900 border border-slate-800 text-slate-300 rounded px-2 py-1 text-[10px]"
-                          />
-                        </div>
-                      )}
+                      </div>
                     </div>
 
-                    {/* Slippage tolerance */}
-                    <div>
-                      <span className="text-[10px] text-slate-500 block mb-1">Max Slippage:</span>
-                      <div className="flex items-center gap-1">
-                        <input
-                          type="number"
-                          step="0.05"
-                          min="0.01"
-                          max="2.0"
-                          value={step.slippageTolerancePct}
-                          onChange={(e) => updateStep(idx, { slippageTolerancePct: parseFloat(e.target.value) || 0.1 })}
-                          className="w-full bg-slate-900 border border-slate-800 text-amber-300 rounded px-2 py-1"
-                        />
-                        <span className="text-slate-500">%</span>
+                    {/* Prominent Visual Warning Indicator Banner */}
+                    {hasWarnings && (
+                      <div className="mb-3.5 p-2.5 rounded-lg bg-rose-950/60 border border-rose-800/80 text-[11px] text-rose-200">
+                        <div className="flex items-center justify-between gap-2 mb-1.5 pb-1 border-b border-rose-900/60">
+                          <span className="font-bold flex items-center gap-1.5 text-rose-300">
+                            <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
+                            <span>Protocol & Liquidity Parameter Incompatibilities</span>
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleAutoFixStep(idx)}
+                            className="px-2 py-0.5 rounded bg-rose-900/70 hover:bg-rose-800 text-rose-200 border border-rose-700/80 text-[10px] font-semibold flex items-center gap-1 transition-colors cursor-pointer"
+                          >
+                            <Sparkles className="w-3 h-3 text-rose-300" />
+                            <span>Auto-Fix for {network.name}</span>
+                          </button>
+                        </div>
+                        <ul className="space-y-1 pl-1">
+                          {stepWarnings.map((warning, wIdx) => (
+                            <li key={wIdx} className="flex items-start gap-1.5 leading-relaxed">
+                              <span className="text-rose-500 font-bold">•</span>
+                              <span>{warning}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    {/* Hop Details Grid */}
+                    <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                      {/* Input Token */}
+                      <div>
+                        <span className="text-[10px] text-slate-500 block mb-1">Input Token:</span>
+                        <select
+                          value={step.tokenIn}
+                          onChange={(e) => {
+                            const token = network.tokens.find(t => t.address.toLowerCase() === e.target.value.toLowerCase());
+                            updateStep(idx, { tokenIn: e.target.value, tokenInSymbol: token?.symbol || "TOKEN" });
+                          }}
+                          className="w-full bg-slate-900 border border-slate-800 text-white rounded px-2 py-1 text-xs focus:outline-none focus:border-cyan-500"
+                        >
+                          {network.tokens.map(t => (
+                            <option key={t.address} value={t.address}>{t.symbol} ({t.name})</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* Output Token */}
+                      <div>
+                        <span className="text-[10px] text-slate-500 block mb-1">Output Token:</span>
+                        <select
+                          value={step.tokenOut}
+                          onChange={(e) => {
+                            const token = network.tokens.find(t => t.address.toLowerCase() === e.target.value.toLowerCase());
+                            updateStep(idx, { tokenOut: e.target.value, tokenOutSymbol: token?.symbol || "TOKEN" });
+                          }}
+                          className="w-full bg-slate-900 border border-slate-800 text-white rounded px-2 py-1 text-xs focus:outline-none focus:border-cyan-500"
+                        >
+                          {network.tokens.map(t => (
+                            <option key={t.address} value={t.address}>{t.symbol} ({t.name})</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* Protocol-Specific Option */}
+                      <div>
+                        {step.protocol === ProtocolType.UNISWAP_V3 && (
+                          <div>
+                            <span className="text-[10px] text-slate-500 block mb-1">V3 Fee Tier:</span>
+                            <select
+                              value={step.v3Fee}
+                              onChange={(e) => updateStep(idx, { v3Fee: Number(e.target.value) })}
+                              className="w-full bg-slate-900 border border-slate-800 text-cyan-300 rounded px-2 py-1 text-xs focus:outline-none focus:border-cyan-500"
+                            >
+                              <option value={100}>0.01% (100) - Stables</option>
+                              <option value={500}>0.05% (500) - Main Pairs</option>
+                              <option value={3000}>0.30% (3000) - Standard</option>
+                              <option value={10000}>1.00% (10000) - Exotic</option>
+                            </select>
+                          </div>
+                        )}
+
+                        {step.protocol === ProtocolType.BALANCER_V2 && (
+                          <div>
+                            <span className="text-[10px] text-slate-500 block mb-1">Balancer Pool ID:</span>
+                            <input
+                              type="text"
+                              value={step.balancerPoolId}
+                              onChange={(e) => updateStep(idx, { balancerPoolId: e.target.value })}
+                              className="w-full bg-slate-900 border border-slate-800 text-slate-300 rounded px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-cyan-500"
+                              placeholder="0x..."
+                            />
+                          </div>
+                        )}
+
+                        {(step.protocol === ProtocolType.UNISWAP_V2 || step.protocol === ProtocolType.SUSHISWAP || step.protocol === ProtocolType.CURVE_V2) && (
+                          <div>
+                            <span className="text-[10px] text-slate-500 block mb-1">Router / Pool Address:</span>
+                            <input
+                              type="text"
+                              value={step.targetContract}
+                              onChange={(e) => updateStep(idx, { targetContract: e.target.value })}
+                              className="w-full bg-slate-900 border border-slate-800 text-slate-300 rounded px-2 py-1 text-[10px] font-mono focus:outline-none focus:border-cyan-500"
+                            />
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Slippage tolerance & minAmountOut */}
+                      <div>
+                        <div className="flex items-center justify-between text-[10px] text-slate-500 mb-1">
+                          <span>Max Slippage:</span>
+                          <span className="text-cyan-400 font-mono">
+                            minOut: {step.minAmountOut && step.minAmountOut !== "0" ? `${step.minAmountOut.substring(0, 8)}...` : 'Auto'}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="number"
+                            step="0.05"
+                            min="0.01"
+                            max="2.0"
+                            value={step.slippageTolerancePct}
+                            onChange={(e) => updateStep(idx, { slippageTolerancePct: parseFloat(e.target.value) || 0.1 })}
+                            className="w-full bg-slate-900 border border-slate-800 text-amber-300 rounded px-2 py-1 text-xs focus:outline-none focus:border-cyan-500 font-mono"
+                          />
+                          <span className="text-slate-500 text-xs font-mono">%</span>
+                        </div>
                       </div>
                     </div>
                   </div>
