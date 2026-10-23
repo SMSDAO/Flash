@@ -1,0 +1,53 @@
+version: '3.8'
+
+# ==============================================================================
+# Phase 3: Automated Docker & Cloud Deployment (docker-compose.yml)
+# Enterprise Flash Loan MEV Arbitrage Execution Daemon
+# ==============================================================================
+# Ensures your 24/7 arbitrage system never goes offline with automatic restart
+# policies, healthcheck probes, and JSON-file log rotation.
+#
+# Quick Start:
+#   docker compose up -d --build
+#   docker compose logs -f --tail 100
+#   docker compose ps
+# ==============================================================================
+
+services:
+  arbitrage-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mev-arbitrage-daemon
+    restart: always
+    environment:
+      - NODE_ENV=production
+      - RPC_WSS=${RPC_WSS:-wss://arb-mainnet.g.alchemy.com/v2/YOUR_API_KEY}
+      - BOT_PRIVATE_KEY=${BOT_PRIVATE_KEY:-your_secure_wallet_private_key_here}
+      - DEPLOYED_ARBITRAGE_CONTRACT=${DEPLOYED_ARBITRAGE_CONTRACT:-0x8382FfDe655848C06C59FE6b6819445Fa191392A}
+      - MEV_RELAY_URL=${MEV_RELAY_URL:-https://relay.flashbots.net}
+      - MEV_BRIBE_BPS=${MEV_BRIBE_BPS:-50}
+      - MIN_PROFIT_ETH=${MIN_PROFIT_ETH:-0.015}
+      - DRY_RUN=${DRY_RUN:-false}
+      - HEALTH_PORT=8080
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:8080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1024M
+        reservations:
+          cpus: '0.25'
+          memory: 256M

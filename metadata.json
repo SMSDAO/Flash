@@ -1,0 +1,7 @@
+{
+  "name": "Enterprise Flash Loan Arbitrage Master Engine",
+  "description": "Enterprise Flash Loan Arbitrage V1.1.0: Adaptive 1-Click Simple & Advanced Pro MEV Interface with Smart Dynamic Failovers and multi-chain execution across Ethereum, Arbitrum, Polygon, Optimism, and zkSync Era.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
